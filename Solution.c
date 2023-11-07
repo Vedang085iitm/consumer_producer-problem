@@ -6,6 +6,9 @@
 #include <stdbool.h>
 #include <time.h>
 
+// Declare the watchdog_thread globally
+pthread_t watchdog_thread;
+
 pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t empty = PTHREAD_COND_INITIALIZER;
 pthread_cond_t fill = PTHREAD_COND_INITIALIZER;
@@ -18,6 +21,9 @@ long long *buffer; // The shared buffer (adjust the size as needed)
 long long items_per_consumer;
 long long consumers_waiting = 0;
 bool all_producers_finished = false;
+
+pthread_mutex_t producers_finished_mtx = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t producers_finished = PTHREAD_COND_INITIALIZER;
 
 // Function to check if the program should exit due to being stuck
 bool shouldExit() {
@@ -43,6 +49,13 @@ bool shouldExit() {
     return false;
 }
 
+void* watchdog(void* arg) {
+    int timeout = *((int*)arg); // Timeout in seconds
+    sleep(timeout);
+    printf("Program stuck; exiting...\n");
+    exit(EXIT_FAILURE);
+}
+
 void *producer(void *arg) {
     long long thread_num = *((long long *)arg);
 
@@ -65,6 +78,13 @@ void *producer(void *arg) {
             exit(EXIT_FAILURE);
         }
     }
+
+    // Signal that this producer is finished
+    pthread_mutex_lock(&producers_finished_mtx);
+    all_producers_finished = true;
+    pthread_cond_signal(&producers_finished);
+    pthread_mutex_unlock(&producers_finished_mtx);
+
     pthread_exit(NULL);
 }
 
@@ -74,11 +94,8 @@ void *consumer(void *arg) {
 
     while (items_consumed < items_per_consumer || !all_producers_finished) {
         pthread_mutex_lock(&mtx);
-        while (numfull == 0) {
-            if (all_producers_finished) {
-                pthread_mutex_unlock(&mtx);
-                break;
-            }
+        while (numfull == 0 && !all_producers_finished) {
+            // Consumer waits for the buffer to have data or for producers to finish
             consumers_waiting++;
             pthread_cond_wait(&fill, &mtx);
             consumers_waiting--;
@@ -105,6 +122,7 @@ void *consumer(void *arg) {
         pthread_exit(NULL);
     }
 }
+
 
 int main(int argc, char *argv[]) {
     printf("#############Start#############\n");
@@ -149,6 +167,12 @@ int main(int argc, char *argv[]) {
     long long producer_args[P];
     long long consumer_args[C];
 
+    int watchdog_timeout = 20;  // Timeout in seconds for the watchdog thread
+    pthread_t watchdog_thread;
+
+    // Create the watchdog thread
+    pthread_create(&watchdog_thread, NULL, watchdog, &watchdog_timeout);
+
     for (long long i = 0; i < P; i++) {
         producer_args[i] = i + 1;
         pthread_create(&producer_threads[i], NULL, producer, &producer_args[i]);
@@ -163,6 +187,13 @@ int main(int argc, char *argv[]) {
     for (long long i = 0; i < P; i++) {
         pthread_join(producer_threads[i], NULL);
     }
+
+    // Wait for all producer threads to finish before setting all_producers_finished
+    pthread_mutex_lock(&producers_finished_mtx);
+    while (!all_producers_finished) {
+        pthread_cond_wait(&producers_finished, &producers_finished_mtx);
+    }
+    pthread_mutex_unlock(&producers_finished_mtx);
 
     // Signal consumer threads that all producers have finished
     pthread_mutex_lock(&mtx);
@@ -181,6 +212,8 @@ int main(int argc, char *argv[]) {
         printf("Program over...\n");
     }
 
+    // Cleanup and exit
     free(buffer);
+    pthread_cancel(watchdog_thread);  // Cancel the watchdog thread
     return 0;
 }
